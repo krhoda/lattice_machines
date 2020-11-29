@@ -105,6 +105,22 @@ where
     fn get_pending(&mut self) -> &mut HashMap<String, T>;
     fn get_fulfilled(&mut self) -> &mut HashMap<String, T>;
 
+    fn append_pending(&mut self, t: T) {
+        self.get_pending().insert(t.uuid(), t);
+    }
+
+    fn append_fulfilled(&mut self, t: T) {
+        self.get_fulfilled().insert(t.uuid(), t);
+    }
+
+    fn append(&mut self, t: T) {
+        if t.is_completed() {
+            self.append_fulfilled(t);
+        } else {
+            self.append_pending(t);
+        };
+    }
+
     // Always public below here:
     fn fulfill(&mut self, key: String) -> Result<(), ()> {
         let pending = self.get_pending();
@@ -129,10 +145,9 @@ where
         }
     }
 
-    fn update(&mut self, key: String, update: U) -> Result<(), ()> {
+    fn update_value(&mut self, key: String, update: U) -> Result<(), ()> {
         let m = self.get_pending();
 
-        // TODO: Make into sane ? or something.
         // TODO: REPORT ERRS, DYING HERE WOULD BE AWFUL.
         let x = m.get_mut(&key);
         match x {
@@ -152,58 +167,72 @@ where
         }
     }
 
-    // fn from_opts_list<A>(&mut self, opts_list: Vec<A>)
-    // where
-    //     A: LatOpt<U>,
-    // {
-    //     for v in opts_list {
-    //         let x: T = WriteLatNode::from_read_lat(ReadLatNode::from_lat_opt(v));
-    //     }
-    // }
-}
+    // boolean indicates whether this relationship blocks the value at is_required_by
+    fn update_required_by(&mut self, target: String, is_required_by: String) -> Result<bool, ()> {
+        // Is the required elm in pending?
+        match self.get_pending().get_mut(&target) {
+            Some(t) => {
+                t.add_required_by(is_required_by);
+                // It IS blocking
+                Ok(true)
+            }
 
-fn machine_from_opts<Base, Opt, Mach, WriteNode, ReadNode>(opts_list: Vec<Opt>) -> Mach
-where
-    Opt: LatOpt<Base>,
-    WriteNode: WriteLatNode<Base>,
-    ReadNode: WriteLatNode<Base>,
-    Mach: LatMachine<WriteNode, Base>,
-{
-    let mut next_lattice = Mach::new();
-
-    for v in opts_list {
-        let x: ReadNode = ReadLatNode::from_lat_opt(v);
-        let y: WriteNode = WriteLatNode::from_read_lat(x);
-        if y.is_completed() {
-            // next_lattice.append_fulfilled(y);
-        } else {
-            // next_lattice.append_active(y);
+            // The required elm must be fulfilled:
+            None => match self.get_fulfilled().get_mut(&target) {
+                // if not err.
+                None => Err(()),
+                Some(t) => {
+                    t.add_required_by(is_required_by);
+                    // It is NOT blocking.
+                    Ok(false)
+                }
+            },
         }
     }
 
-    next_lattice
+    fn update_depends_on(&mut self, target: String, depends_on: String) -> Result<(), ()> {
+        // Is the required elm in pending?
+        match self.get_pending().get_mut(&target) {
+            Some(t) => {
+                t.add_depends_on(depends_on);
+                Ok(())
+            }
+
+            // The required elm must be fulfilled:
+            None => Err(())
+        }
+    }
 }
 
-pub trait DynLatMachine<T, U>: LatMachine<T, U>
+pub struct BasicLattice<T> {
+    pending: HashMap<String, T>,
+    fulfilled: HashMap<String, T>,
+}
+
+impl<T, U> LatMachine<T, U> for BasicLattice<T>
 where
     T: WriteLatNode<U>,
 {
-    fn invalidate(&mut self, key: String) -> Result<(), ()>;
-    // TODO: Refine?
-    fn add_node(&mut self, target: T) -> Result<(), ()>;
-}
-
-pub fn opt_list_to_map<T, U>(opt_list: Vec<T>) -> Option<HashMap<String, T>>
-where
-    T: LatOpt<U>,
-{
-    if opt_list.is_empty() {
-        None
-    } else {
-        let mut m: HashMap<String, T> = HashMap::new();
-        for o in opt_list {
-            m.insert(o.uuid(), o);
+    fn new() -> Self {
+        BasicLattice {
+            pending: HashMap::new(),
+            fulfilled: HashMap::new(),
         }
-        Some(m)
+    }
+
+    fn read_pending(&self) -> &HashMap<String, T> {
+        &self.pending
+    }
+
+    fn read_fulfilled(&self) -> &HashMap<String, T> {
+        &self.fulfilled
+    }
+
+    fn get_pending(&mut self) -> &mut HashMap<String, T> {
+        &mut self.pending
+    }
+
+    fn get_fulfilled(&mut self) -> &mut HashMap<String, T> {
+        &mut self.fulfilled
     }
 }
