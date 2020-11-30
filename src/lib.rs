@@ -1,33 +1,19 @@
 use std::collections::HashMap;
 
-// LatOpt is the bare minimum information to build a lattice out of
-pub trait LatOpt<T> {
-    // new creates a new LatOpt out of the base data type
-    fn new(t: T) -> Self;
-    // returns the UUID of the LatOpt
+// The base data and measure of "completed-ness" required to be
+// useable inside of a lattice machine
+pub trait NodeType {
+    // returns the UUID of the NodeType to be used by the NodeOpt
     fn uuid(&self) -> String;
-    // returns the list of UUIDs that the LatOpt depends on
-    fn depends_list(&self) -> Vec<String>;
     // returns if the base data type is completed
     fn is_completed(&self) -> bool;
 }
 
-pub trait ReadLatNode<T>: LatOpt<T> {
-    fn from_lat_opt<A>(l: A) -> Self
-    where
-        A: LatOpt<T>;
-    // Once depends_on and fulfilled_by are satisfied, we get
-    // depends_list for free, not that it's particularly useful.
-    fn depends_list(&self) -> Vec<String> {
-        let mut v: Vec<String> = Vec::new();
-        let mut k1: Vec<String> = self.depends_on().keys().cloned().collect();
-        v.append(&mut k1);
+pub trait ReadNode<T>: NodeType {
+    // new creates a new NodeOpt out of the base data type
+    // and list of relations it depends on.
+    fn new(base_data: T, depends_on: Vec<String>, required_by: Vec<String>) -> Self;
 
-        let mut k2: Vec<String> = self.fulfilled_by().keys().cloned().collect();
-        v.append(&mut k2);
-
-        v
-    }
     // returns a hashmap where keys are the LatNode who this LatNode depends on being
     // complete before becoming active and a bool indicating whether that LatNode
     // is active or not
@@ -37,19 +23,69 @@ pub trait ReadLatNode<T>: LatOpt<T> {
     // returns a hashmap where keys are the completed LatNodes this depended on.
     fn fulfilled_by(&self) -> &HashMap<String, ()>;
     // returns whether this LatNode should be active.
-    fn active(&self) -> bool {
-        if self.is_completed() {
-            return false;
-        };
+    fn is_active(&self) -> bool {
+        !(!self.is_completed() && self.depends_on().is_empty())
+    }
 
-        self.depends_on().is_empty()
+    fn is_pending(&self) -> bool {
+        !self.depends_on().is_empty() || !self.is_completed()
     }
 }
 
-pub trait WriteLatNode<T>: ReadLatNode<T> {
-    fn from_read_lat<A>(l: A) -> Self
-    where
-        A: ReadLatNode<T>;
+pub struct BasicNode<T>
+where
+    T: NodeType,
+{
+    base_data: T,
+    depends_on: HashMap<String, ()>,
+    required_by: HashMap<String, ()>,
+    fulfilled_by: HashMap<String, ()>,
+}
+
+impl<T: NodeType> NodeType for BasicNode<T> {
+    fn uuid(&self) -> String {
+        self.base_data.uuid()
+    }
+
+    fn is_completed(&self) -> bool {
+        self.base_data.is_completed()
+    }
+}
+
+impl<T: NodeType> ReadNode<T> for BasicNode<T> {
+    fn new(t: T, depends_on: Vec<String>, required_by: Vec<String>) -> Self {
+        let mut s = Self {
+            base_data: t,
+            depends_on: HashMap::new(),
+            fulfilled_by: HashMap::new(),
+            required_by: HashMap::new(),
+        };
+
+        for v in depends_on {
+            s.depends_on.insert(v, ());
+        }
+
+        for v in required_by {
+            s.required_by.insert(v, ());
+        }
+
+        s
+    }
+
+    fn depends_on(&self) -> &HashMap<String, ()> {
+        &self.depends_on
+    }
+
+    fn required_by(&self) -> &HashMap<String, ()> {
+        &self.required_by
+    }
+
+    fn fulfilled_by(&self) -> &HashMap<String, ()> {
+        &self.fulfilled_by
+    }
+}
+
+pub trait WriteNode<T>: ReadNode<T> {
     // returns a mutable reference to a hashmap where keys are the
     // LatNode who this LatNode depends on being
     // complete before becoming active and a bool indicating whether
@@ -87,9 +123,28 @@ pub trait WriteLatNode<T>: ReadLatNode<T> {
     fn update(&mut self, t: T) -> Result<(), ()>;
 }
 
+impl<T: NodeType> WriteNode<T> for BasicNode<T> {
+    fn get_depends_on(&mut self) -> &mut HashMap<String, ()> {
+        &mut self.depends_on
+    }
+
+    fn get_required_by(&mut self) -> &mut HashMap<String, ()> {
+        &mut self.required_by
+    }
+
+    fn get_fulfilled_by(&mut self) -> &mut HashMap<String, ()> {
+        &mut self.fulfilled_by
+    }
+
+    fn update(&mut self, t: T) -> Result<(), ()> {
+        self.base_data = t;
+        Ok(())
+    }
+}
+
 pub trait LatMachine<T, U>
 where
-    T: WriteLatNode<U>,
+    T: WriteNode<U>,
 {
     // default impl?
     fn new() -> Self;
@@ -114,35 +169,82 @@ where
     }
 
     fn append(&mut self, t: T) {
-        if t.is_completed() {
-            self.append_fulfilled(t);
-        } else {
+        if t.is_pending() {
             self.append_pending(t);
+        } else {
+            self.append_fulfilled(t);
         };
     }
 
     // Always public below here:
     fn fulfill(&mut self, key: String) -> Result<(), ()> {
+        let mut cascasde = Vec::<String>::new();
         let pending = self.get_pending();
         match pending.remove(&key) {
             None => Err(()),
             Some(mut target) => {
                 let r_map = target.get_required_by();
-                for k in r_map {
-                    match pending.get_mut(k.0) {
-                        // We assume it is in fulfilled.
-                        None => {}
+                for (k, _) in r_map {
+                    match pending.get_mut(k) {
+                        None => return Err(()),
                         Some(x) => match x.depend_fulfilled(key.clone()) {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                if !x.is_pending() {
+                                    cascasde.push(x.uuid());
+                                }
+                            }
                             Err(()) => return Err(()),
                         },
                     };
                 }
 
                 self.get_fulfilled().insert(key, target);
+
+                for v in cascasde {
+                    match self.fulfill(v) {
+                        Err(()) => return Err(()),
+                        Ok(()) => {}
+                    };
+                }
+
                 Ok(())
             }
         }
+    }
+
+    // TODO: IMPLEMENT
+    fn unfulfill(&mut self, key: String) -> Result<(), ()> {
+        Ok(())
+        // let mut cascasde = Vec::<String>::new();
+        // let pending = self.get_pending();
+        // match pending.remove(&key) {
+        //     None => Err(()),
+        //     Some(mut target) => {
+        //         let r_map = target.get_required_by();
+        //         for (k, _) in r_map {
+        //             match pending.get_mut(k) {
+        //                 None => return Err(()),
+        //                 Some(x) => match x.depend_fulfilled(key.clone()) {
+        //                     Ok(()) => {
+        //                         if !x.is_pending() {
+        //                             cascasde.push(x.uuid());
+        //                         }
+        //                     }
+        //                     Err(()) => return Err(()),
+        //                 },
+        //             };
+        //         }
+        //         self.get_fulfilled().insert(key, target);
+        //         for v in cascasde {
+        //             match self.fulfill(v) {
+        //                 Err(()) => return Err(()),
+        //                 Ok(()) => {}
+        //             };
+        //         }
+        //         Ok(())
+        //     }
+        // }
+
     }
 
     fn update_value(&mut self, key: String, update: U) -> Result<(), ()> {
@@ -199,8 +301,65 @@ where
             }
 
             // The required elm must be fulfilled:
-            None => Err(())
+            None => match self.get_fulfilled().remove(&target) {
+                // Unknown key in either map.
+                None => Err(()),
+                Some(mut t) => {
+                    t.add_depends_on(depends_on);
+                    self.append(t);
+                    Ok(())
+                }
+            },
         }
+    }
+
+    fn add_requirement(&mut self, requires: String, is_required: String) -> Result<(), ()> {
+        // search for requires
+        let mut is_still_required = false;
+
+        match self.get_pending().get_mut(&is_required) {
+            Some(is_req) => {
+                is_still_required = true;
+                is_req.add_required_by(requires.clone());
+            }
+            None => match self.get_fulfilled().get_mut(&is_required) {
+                None => return Err(()),
+                Some(is_req) => {
+                    is_req.add_required_by(requires.clone());
+                }
+            },
+        };
+
+        match self.get_pending().get_mut(&requires) {
+            Some(req) => {
+                req.add_depends_on(is_required.clone());
+                if !is_still_required {
+                    req.depend_fulfilled(is_required).unwrap();
+                }
+            }
+
+            None => {
+                if is_still_required {
+                    match self.get_fulfilled().remove(&requires) {
+                        None => return Err(()),
+                        Some(mut req) => {
+                            req.add_depends_on(is_required);
+                            self.append(req);
+                        }
+                    }
+                } else {
+                    match self.get_fulfilled().get_mut(&requires) {
+                        None => return Err(()),
+                        Some(req) => {
+                            req.add_depends_on(is_required.clone());
+                            req.depend_fulfilled(is_required).unwrap();
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok(())
     }
 }
 
@@ -209,9 +368,51 @@ pub struct BasicLattice<T> {
     fulfilled: HashMap<String, T>,
 }
 
+impl<T: NodeType> BasicLattice<BasicNode<T>>
+where
+    T: NodeType,
+{
+    pub fn from_node_list(v: Vec<BasicNode<T>>) -> BasicLattice<BasicNode<T>> {
+        let mut s = BasicLattice::new();
+        let mut keys = Vec::<String>::new();
+
+        for node in v {
+            if !node.is_pending() {
+                keys.push(node.uuid().to_string());
+            }
+
+            s.append_pending(node);
+        }
+
+        for key in keys {
+            s.fulfill(key);
+        }
+
+        s
+    }
+}
+
+// Why doesn't this work?
+// impl<T: WriteNode<U>, U> BasicLattice<T>
+// where
+//     T: WriteNode<U>,
+// {
+//     pub fn from_node_list(v: Vec<T>) -> BasicLattice<BasicNode<T>> {
+//         let mut s = BasicLattice::new();
+//         let mut full_map = HashMap::<String, ()>::new();
+//         for node in v {
+//             full_map.insert(node.uuid(), ());
+//             if node.depends_on().is_empty() {
+//                 s.append(node);
+//             };
+//         }
+//         s
+//     }
+// }
+
 impl<T, U> LatMachine<T, U> for BasicLattice<T>
 where
-    T: WriteLatNode<U>,
+    T: WriteNode<U>,
 {
     fn new() -> Self {
         BasicLattice {
